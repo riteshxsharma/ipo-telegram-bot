@@ -1,8 +1,8 @@
 import configparser
-import sys
 import telegram
 import pandas as pd
 from datetime import datetime, timedelta
+
 import requests
 import io
 
@@ -28,8 +28,27 @@ def load_config():
     }
 
 # --- Data Fetching Functions ---
+def get_ipo_data(config):
+    """Fetches, combines, and cleans IPO data from all sources."""
+    print("Fetching all IPO data...")
+    today = datetime.now()
+    future_date = today + timedelta(days=30)
+    
+    av_ipos = get_alpha_vantage_ipos(config['alpha_vantage_key'])
+    fh_ipos = get_finnhub_ipos(config['finnhub_key'], today.strftime('%Y-%m-%d'), future_date.strftime('%Y-%m-%d'))
+    
+    combined_df = pd.concat([av_ipos, fh_ipos], ignore_index=True) if not (av_ipos.empty and fh_ipos.empty) else pd.DataFrame()
+
+    if not combined_df.empty:
+        combined_df['IPO Date'] = pd.to_datetime(combined_df['IPO Date'], errors='coerce')
+        combined_df.dropna(subset=['IPO Date'], inplace=True)
+        combined_df.drop_duplicates(subset=['symbol'], keep='first', inplace=True)
+        print(f"Total unique IPOs found: {len(combined_df)}")
+        return combined_df
+    
+    return pd.DataFrame()
+
 def get_alpha_vantage_ipos(api_key):
-    """Gets IPO data from the Alpha Vantage API."""
     print("Fetching IPO data from Alpha Vantage...")
     url = f"https://www.alphavantage.co/query?function=IPO_CALENDAR&apikey={api_key}"
     try:
@@ -44,7 +63,6 @@ def get_alpha_vantage_ipos(api_key):
         return pd.DataFrame()
 
 def get_finnhub_ipos(api_key, start_date, end_date):
-    """Gets IPO data from the Finnhub API for a given date range."""
     print(f"Fetching IPO data from Finnhub for {start_date} to {end_date}...")
     url = f"https://finnhub.io/api/v1/calendar/ipo?from={start_date}&to={end_date}&token={api_key}"
     try:
@@ -63,35 +81,79 @@ def get_finnhub_ipos(api_key, start_date, end_date):
         print(f"Could not fetch or process Finnhub data. Error: {e}")
         return pd.DataFrame()
 
-# --- Telegram Bot Function ---
-def send_ipo_update(bot, chat_ids, combined_ipos_df, mode='daily'):
-    """Formats and sends the consolidated IPO list to multiple Telegram chats."""
-    today = pd.to_datetime(datetime.now().date())
-    message = ""
+# --- Helper function for formatting a message for a specific period ---
+def format_ipo_period(df, start_date, end_date, title, empty_message):
+    """Filters a DataFrame for a date range and returns a formatted string."""
+    mask = (df['IPO Date'] >= start_date) & (df['IPO Date'] <= end_date)
+    period_df = df.loc[mask]
     
-    if mode == 'daily':
-        message = f"**IPOs for Today, {today.strftime('%A, %b %d')}**\n\n"
-        if combined_ipos_df.empty:
-            message += "No IPOs scheduled for today."
-        else:
-            for _, row in combined_ipos_df.iterrows():
-                message += f"- {row['Company Name']} ({row['symbol']})\n"
-    
-    elif mode == 'weekly':
-        next_week_end = today + timedelta(days=7)
-        message = f"**Upcoming IPOs for the Week ({today.strftime('%b %d')} - {next_week_end.strftime('%b %d')})**\n\n"
-        if combined_ipos_df.empty:
-            message += "No IPOs found for the upcoming week."
-        else:
-            combined_ipos_df = combined_ipos_df.sort_values(by='IPO Date')
-            # The error occurs on the next line, so the fix must happen before it
-            for date, group in combined_ipos_df.groupby(combined_ipos_df['IPO Date'].dt.date):
-                message += f"**{date.strftime('%A, %b %d')}**\n"
-                for _, row in group.iterrows():
-                    message += f"- {row['Company Name']} ({row['symbol']})\n"
-                message += "\n"
+    if period_df.empty:
+        return f"**{title}**\n_{empty_message}_\n\n"
 
-    for chat_id in chat_ids:
+    message = f"**{title}**\n"
+    period_df = period_df.sort_values(by='IPO Date')
+    for date, group in period_df.groupby(period_df['IPO Date'].dt.date):
+        message += f"_{date.strftime('%A, %b %d')}_\n"
+        for _, row in group.iterrows():
+            message += f"- {row['Company Name']} ({row['symbol']})\n"
+        message += "\n"
+    return message
+
+# --- MAIN EXECUTION BLOCK ---
+if __name__ == "__main__":
+    print(f"Starting IPO report job at {datetime.now()}...")
+    config = load_config()
+    ipo_data = get_ipo_data(config)
+    
+    # --- Day-of-the-week Logic ---
+    today = datetime.now()
+    today_date = pd.to_datetime(today.date())
+    day_of_week = today.weekday() # Monday=0, Sunday=6
+    
+    message = ""
+
+    # Monday, Tuesday, Wednesday: Daily + Remainder of Week
+    if 0 <= day_of_week <= 2:
+        day_name = today.strftime('%A')
+        message = f"**IPO Report for {day_name}, {today.strftime('%b %d')}**\n\n"
+        message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
+        
+        start_of_rest_of_week = today_date + timedelta(days=1)
+        end_of_week = today_date + timedelta(days=(6 - day_of_week))
+        if start_of_rest_of_week <= end_of_week:
+             message += format_ipo_period(ipo_data, start_of_rest_of_week, end_of_week, "Remainder of This Week", "None for the rest of this week.")
+
+    # Thursday: Daily + Rest of Week + Next Week
+    elif day_of_week == 3:
+        message = f"**IPO Outlook for Thursday, {today.strftime('%b %d')}**\n\n"
+        message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
+        
+        fri_date = today_date + timedelta(days=1)
+        sun_date = today_date + timedelta(days=3)
+        message += format_ipo_period(ipo_data, fri_date, sun_date, "Remainder of This Week", "None for the rest of this week.")
+
+        next_mon = today_date + timedelta(days=4)
+        next_sun = next_mon + timedelta(days=6)
+        message += format_ipo_period(ipo_data, next_mon, next_sun, "Next Week's IPOs", "None scheduled for next week yet.")
+
+    # Friday: Daily + Next Week
+    elif day_of_week == 4:
+        message = f"**IPO Report for Friday, {today.strftime('%b %d')}**\n\n"
+        message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
+        
+        next_mon = today_date + timedelta(days=3)
+        next_sun = next_mon + timedelta(days=6)
+        message += format_ipo_period(ipo_data, next_mon, next_sun, "Next Week's IPOs", "None scheduled for next week yet.")
+
+    # Saturday, Sunday: Upcoming 7 Days
+    else:
+        end_of_period = today_date + timedelta(days=7)
+        title = f"Upcoming IPOs for the Next 7 Days ({today_date.strftime('%b %d')} - {end_of_period.strftime('%b %d')})"
+        message = format_ipo_period(ipo_data, today_date, end_of_period, title, "No IPOs found for the upcoming 7 days.")
+
+    # Send the final message to all chats
+    bot = telegram.Bot(token=config['telegram_token'])
+    for chat_id in config['chat_ids']:
         try:
             if len(message) > 4096:
                 bot.send_message(chat_id=chat_id, text=message[:4090] + "\n...", parse_mode=telegram.ParseMode.MARKDOWN)
@@ -100,52 +162,5 @@ def send_ipo_update(bot, chat_ids, combined_ipos_df, mode='daily'):
             print(f"Message sent successfully to chat ID: {chat_id}")
         except Exception as e:
             print(f"Failed to send message to chat ID: {chat_id}. Error: {e}")
-
-# --- Main Job Function ---
-def run_job(mode):
-    """Runs the main logic for either daily or weekly reports."""
-    print(f"Running consolidated IPO check in '{mode}' mode...")
-    config = load_config()
-    
-    today = datetime.now()
-    if mode == 'daily':
-        start_date_str = end_date_str = today.strftime('%Y-%m-%d')
-    else: # weekly
-        start_date_str = today.strftime('%Y-%m-%d')
-        end_date_str = (today + timedelta(days=7)).strftime('%Y-%m-%d')
-        
-    av_ipos = get_alpha_vantage_ipos(config['alpha_vantage_key'])
-    fh_ipos = get_finnhub_ipos(config['finnhub_key'], start_date_str, end_date_str)
-
-    combined_df = pd.concat([av_ipos, fh_ipos], ignore_index=True) if not (av_ipos.empty and fh_ipos.empty) else pd.DataFrame()
-
-    if not combined_df.empty:
-        combined_df['IPO Date'] = pd.to_datetime(combined_df['IPO Date'], errors='coerce')
-        
-        # --- THE FIX ---
-        # Remove any rows where the date conversion failed (resulting in NaT)
-        combined_df.dropna(subset=['IPO Date'], inplace=True)
-        
-        combined_df.drop_duplicates(subset=['symbol'], keep='first', inplace=True)
-        
-        start_date = pd.to_datetime(start_date_str)
-        end_date = pd.to_datetime(end_date_str)
-        final_df = combined_df[(combined_df['IPO Date'] >= start_date) & (combined_df['IPO Date'] <= end_date)]
-        
-        print(f"Total unique IPOs for the period: {len(final_df)}")
-    else:
-        final_df = pd.DataFrame()
-    
-    bot = telegram.Bot(token=config['telegram_token'])
-    send_ipo_update(bot, config['chat_ids'], final_df, mode=mode)
-
-# --- MAIN EXECUTION BLOCK ---
-if __name__ == "__main__":
-    day_of_week = datetime.now().weekday()
-    
-    if day_of_week >= 5: # Saturday (5) or Sunday (6)
-        run_job(mode='weekly')
-    else: # Weekday (0-4)
-        run_job(mode='daily')
-        
+            
     print("IPO check complete. Exiting.")
