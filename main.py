@@ -1,4 +1,4 @@
-import os
+import configparser
 import sys
 import telegram
 import pandas as pd
@@ -8,23 +8,23 @@ import io
 
 # --- Configuration ---
 def load_config():
-    """Loads all API keys and chat IDs from environment variables."""
-    print("Loading configuration from environment variables...")
-    telegram_token = os.environ.get('TELEGRAM_TOKEN')
-    chat_ids_str = os.environ.get('CHAT_IDS')
-    av_key = os.environ.get('AV_API_KEY')
-    fh_key = os.environ.get('FINNHUB_API_KEY')
-
-    if not all([telegram_token, chat_ids_str, av_key, fh_key]):
-        raise ValueError("One or more required environment variables are missing. Please check the 'docker run' command.")
+    """Loads all API keys and chat IDs from config.ini"""
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    if 'telegram' not in config or 'alpha_vantage' not in config or 'finnhub' not in config:
+        raise KeyError("Config file must contain [telegram], [alpha_vantage], and [finnhub] sections.")
+    
+    chat_ids_str = config['telegram'].get('chat_ids')
+    if not chat_ids_str:
+        raise ValueError("'chat_ids' not found or is empty in config.ini")
     
     chat_ids = [item.strip() for item in chat_ids_str.split(',')]
     
     return {
-        'telegram_token': telegram_token,
+        'telegram_token': config['telegram']['bot_token'],
         'chat_ids': chat_ids,
-        'alpha_vantage_key': av_key,
-        'finnhub_key': fh_key
+        'alpha_vantage_key': config['alpha_vantage']['api_key'],
+        'finnhub_key': config['finnhub']['api_key']
     }
 
 # --- Data Fetching Functions ---
@@ -46,6 +46,7 @@ def get_ipo_data(config):
         print(f"Total unique IPOs found: {len(combined_df)}")
         return combined_df
     
+    print("No IPO data found from any source.")
     return pd.DataFrame()
 
 def get_alpha_vantage_ipos(api_key):
@@ -81,10 +82,14 @@ def get_finnhub_ipos(api_key, start_date, end_date):
         print(f"Could not fetch or process Finnhub data. Error: {e}")
         return pd.DataFrame()
 
-
-# --- Helper function for formatting a message ---
+# --- Helper function for formatting a message for a specific period ---
 def format_ipo_period(df, start_date, end_date, title, empty_message):
-    mask = (df['IPO Date'].dt.date >= start_date.date()) & (df['IPO Date'].dt.date <= end_date.date())
+    """Filters a DataFrame for a date range and returns a formatted string."""
+    # Ensure the DataFrame is not empty before proceeding
+    if df.empty:
+        return f"**{title}**\n_{empty_message}_\n\n"
+
+    mask = (df['IPO Date'] >= start_date) & (df['IPO Date'] <= end_date)
     period_df = df.loc[mask]
     
     if period_df.empty:
@@ -99,7 +104,7 @@ def format_ipo_period(df, start_date, end_date, title, empty_message):
         message += "\n"
     return message
 
-# --- Main Execution Block ---
+# --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
     print(f"Starting IPO report job at {datetime.now()}...")
     config = load_config()
@@ -112,35 +117,42 @@ if __name__ == "__main__":
     
     message = ""
 
-    # ... (Day-of-the-week logic remains the same) ...
-    if 0 <= day_of_week <= 2:
+    # --- THE FIX: Check if ipo_data is empty at the very beginning ---
+    if ipo_data.empty:
+        print("No data retrieved from APIs. Sending simple 'no IPOs' message.")
         day_name = today.strftime('%A')
-        message = f"**IPO Report for {day_name}, {today.strftime('%b %d')}**\n\n"
-        message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
-        start_of_rest_of_week = today_date + timedelta(days=1)
-        end_of_week = today_date + timedelta(days=(6 - day_of_week))
-        if start_of_rest_of_week <= end_of_week:
-             message += format_ipo_period(ipo_data, start_of_rest_of_week, end_of_week, "Remainder of This Week", "None for the rest of this week.")
-    elif day_of_week == 3:
-        message = f"**IPO Outlook for Thursday, {today.strftime('%b %d')}**\n\n"
-        message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
-        fri_date = today_date + timedelta(days=1)
-        sun_date = today_date + timedelta(days=3)
-        message += format_ipo_period(ipo_data, fri_date, sun_date, "Remainder of This Week", "None for the rest of this week.")
-        next_mon = today_date + timedelta(days=4)
-        next_sun = next_mon + timedelta(days=6)
-        message += format_ipo_period(ipo_data, next_mon, next_sun, "Next Week's IPOs", "None scheduled for next week yet.")
-    elif day_of_week == 4:
-        message = f"**IPO Report for Friday, {today.strftime('%b %d')}**\n\n"
-        message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
-        next_mon = today_date + timedelta(days=3)
-        next_sun = next_mon + timedelta(days=6)
-        message += format_ipo_period(ipo_data, next_mon, next_sun, "Next Week's IPOs", "None scheduled for next week yet.")
+        message = f"No IPOs scheduled for today, {day_name}, {today.strftime('%b %d')}."
     else:
-        end_of_period = today_date + timedelta(days=7)
-        title = f"Upcoming IPOs for the Next 7 Days ({today_date.strftime('%b %d')} - {end_of_period.strftime('%b %d')})"
-        message = format_ipo_period(ipo_data, today_date, end_of_period, title, "No IPOs found for the upcoming 7 days.")
+        # Day-of-the-week Logic
+        if 0 <= day_of_week <= 2:
+            day_name = today.strftime('%A')
+            message = f"**IPO Report for {day_name}, {today.strftime('%b %d')}**\n\n"
+            message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
+            start_of_rest_of_week = today_date + timedelta(days=1)
+            end_of_week = today_date + timedelta(days=(6 - day_of_week))
+            if start_of_rest_of_week <= end_of_week:
+                 message += format_ipo_period(ipo_data, start_of_rest_of_week, end_of_week, "Remainder of This Week", "None for the rest of this week.")
+        elif day_of_week == 3:
+            message = f"**IPO Outlook for Thursday, {today.strftime('%b %d')}**\n\n"
+            message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
+            fri_date = today_date + timedelta(days=1)
+            sun_date = today_date + timedelta(days=3)
+            message += format_ipo_period(ipo_data, fri_date, sun_date, "Remainder of This Week", "None for the rest of this week.")
+            next_mon = today_date + timedelta(days=4)
+            next_sun = next_mon + timedelta(days=6)
+            message += format_ipo_period(ipo_data, next_mon, next_sun, "Next Week's IPOs", "None scheduled for next week yet.")
+        elif day_of_week == 4:
+            message = f"**IPO Report for Friday, {today.strftime('%b %d')}**\n\n"
+            message += format_ipo_period(ipo_data, today_date, today_date, "Today's IPOs", "None for today.")
+            next_mon = today_date + timedelta(days=3)
+            next_sun = next_mon + timedelta(days=6)
+            message += format_ipo_period(ipo_data, next_mon, next_sun, "Next Week's IPOs", "None scheduled for next week yet.")
+        else:
+            end_of_period = today_date + timedelta(days=7)
+            title = f"Upcoming IPOs for the Next 7 Days ({today_date.strftime('%b %d')} - {end_of_period.strftime('%b %d')})"
+            message = format_ipo_period(ipo_data, today_date, end_of_period, title, "No IPOs found for the upcoming 7 days.")
 
+    # Send the final message to all chats
     for chat_id in config['chat_ids']:
         try:
             if len(message) > 4096:
